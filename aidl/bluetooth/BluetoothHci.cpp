@@ -47,43 +47,51 @@ class BluetoothDeathRecipient {
   public:
     BluetoothDeathRecipient(BluetoothHci* hci) : mHci(hci) {}
 
-    void LinkToDeath(const std::shared_ptr<IBluetoothHciCallbacks>& cb) {
-        mCb = cb;
-        clientDeathRecipient_ = AIBinder_DeathRecipient_new(OnDeath);
-        auto linkToDeathReturnStatus = AIBinder_linkToDeath(
-                mCb->asBinder().get(), clientDeathRecipient_, this /* cookie */);
-        LOG_ALWAYS_FATAL_IF(linkToDeathReturnStatus != STATUS_OK,
-                            "Unable to link to death recipient");
+    ~BluetoothDeathRecipient() {
+        UnlinkToDeath();
     }
 
-    void UnlinkToDeath(const std::shared_ptr<IBluetoothHciCallbacks>& cb) {
-        LOG_ALWAYS_FATAL_IF(cb != mCb, "Unable to unlink mismatched pointers");
+    void LinkToDeath(const std::shared_ptr<IBluetoothHciCallbacks>& cb) {
+        std::lock_guard<std::mutex> guard(mMutex);
+        if (mCb != nullptr && clientDeathRecipient_ != nullptr) {
+            AIBinder_unlinkToDeath(mCb->asBinder().get(), clientDeathRecipient_, this);
+            AIBinder_DeathRecipient_delete(clientDeathRecipient_);
+            clientDeathRecipient_ = nullptr;
+        }
+        mCb = cb;
+        if (mCb != nullptr) {
+            clientDeathRecipient_ = AIBinder_DeathRecipient_new(OnDeath);
+            auto linkToDeathReturnStatus = AIBinder_linkToDeath(
+                    mCb->asBinder().get(), clientDeathRecipient_, this /* cookie */);
+            if (linkToDeathReturnStatus != STATUS_OK) {
+                ALOGE("Unable to link to death recipient: %d", linkToDeathReturnStatus);
+                AIBinder_DeathRecipient_delete(clientDeathRecipient_);
+                clientDeathRecipient_ = nullptr;
+            }
+        }
+    }
+
+    void UnlinkToDeath() {
+        std::lock_guard<std::mutex> guard(mMutex);
+        if (mCb != nullptr && clientDeathRecipient_ != nullptr) {
+            AIBinder_unlinkToDeath(mCb->asBinder().get(), clientDeathRecipient_, this);
+            AIBinder_DeathRecipient_delete(clientDeathRecipient_);
+            clientDeathRecipient_ = nullptr;
+        }
+        mCb = nullptr;
     }
 
     void serviceDied() {
-        if (mCb != nullptr && !AIBinder_isAlive(mCb->asBinder().get())) {
-            ALOGE("Bluetooth remote service has died");
-        } else {
-            ALOGE("BluetoothDeathRecipient::serviceDied called but service not dead");
-            return;
-        }
-        {
-            std::lock_guard<std::mutex> guard(mHasDiedMutex);
-            has_died_ = true;
-        }
+        ALOGW("Bluetooth remote service has died, cleaning up HAL");
+        UnlinkToDeath();
         mHci->close();
-    }
-    BluetoothHci* mHci;
-    std::shared_ptr<IBluetoothHciCallbacks> mCb;
-    AIBinder_DeathRecipient* clientDeathRecipient_;
-    bool getHasDied() {
-        std::lock_guard<std::mutex> guard(mHasDiedMutex);
-        return has_died_;
     }
 
   private:
-    std::mutex mHasDiedMutex;
-    bool has_died_{false};
+    BluetoothHci* mHci;
+    std::shared_ptr<IBluetoothHciCallbacks> mCb{nullptr};
+    AIBinder_DeathRecipient* clientDeathRecipient_{nullptr};
+    std::mutex mMutex;
 };
 
 void OnDeath(void* cookie) {
@@ -108,16 +116,22 @@ ndk::ScopedAStatus BluetoothHci::initialize(const std::shared_ptr<IBluetoothHciC
         std::lock_guard<std::mutex> guard(mStateMutex);
         if (mState != HalState::READY) {
             old_state = mState;
-        } else {
-            mState = HalState::INITIALIZING;
         }
     }
 
     if (old_state != HalState::READY) {
-        ALOGE("initialize: Unexpected State %d", static_cast<int>(old_state));
+        ALOGW("initialize: Unexpected State %d, forcing close and resetting state",
+              static_cast<int>(old_state));
         close();
-        cb->initializationComplete(Status::ALREADY_INITIALIZED);
-        return ndk::ScopedAStatus::ok();
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(mStateMutex);
+        mState = HalState::INITIALIZING;
+    }
+
+    if (mDeathRecipient) {
+        mDeathRecipient->LinkToDeath(cb);
     }
 
     bool rc = VendorInterface::Initialize(
@@ -133,6 +147,9 @@ ndk::ScopedAStatus BluetoothHci::initialize(const std::shared_ptr<IBluetoothHciC
             [this]() { ALOGI("HCI socket device disconnected"); });
     if (!rc) {
         ALOGE("VendorInterface::Initialize failed");
+        if (mDeathRecipient) {
+            mDeathRecipient->UnlinkToDeath();
+        }
         VendorInterface::Shutdown();
         {
             std::lock_guard<std::mutex> guard(mStateMutex);
@@ -156,17 +173,21 @@ ndk::ScopedAStatus BluetoothHci::close() {
     ALOGI("%s:Bluetooth HCI close sequence initiated via AIDL", __func__);
     {
         std::lock_guard<std::mutex> guard(mStateMutex);
-        if (mState != HalState::ONE_CLIENT) {
+        if (mState != HalState::ONE_CLIENT && mState != HalState::INITIALIZING) {
             ALOGI("Already closed");
             return ndk::ScopedAStatus::ok();
         }
         mState = HalState::CLOSING;
     }
     ALOGI("%s: HalState set moving to CLOSING", __func__);
+    if (mDeathRecipient) {
+        mDeathRecipient->UnlinkToDeath();
+    }
     VendorInterface::Shutdown();
     {
         std::lock_guard<std::mutex> guard(mStateMutex);
         mState = HalState::READY;
+        mCb = nullptr;
     }
     ALOGI("%s: Shutdown complete, HalState moving to READY", __func__);
     return ndk::ScopedAStatus::ok();
